@@ -398,7 +398,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("-N", "--numba-branch",    default=DEFAULT_BRANCH, metavar="REF",
                         help="Ref for numba workflows")
     parser.add_argument("-s", "--steps", default="all", metavar="STEPS",
-                        help="Comma-separated steps (llvmdev,llvmlite_conda,llvmlite_wheels,numba_conda,numba_wheels,download_llvmlite_conda,download_llvmlite_wheels,download_numba_conda,download_numba_wheels,all)")
+                        help="Comma-separated steps (llvmdev,llvmlite_conda,llvmlite_wheels,numba_conda,numba_wheels,download_llvmdev,download_llvmlite_conda,download_llvmlite_wheels,download_numba_conda,download_numba_wheels,all)")
     parser.add_argument("-p", "--platforms", default=",".join(DEFAULT_PLATFORMS), metavar="PLATS",
                         help="Comma-separated platforms")
     parser.add_argument("-f", "--state-path", default=str((Path(__file__).parent / ".ci_state.json").resolve()),
@@ -485,6 +485,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             branch_ref=args.numba_branch
         ),
         # Downloads
+        "download_llvmdev": Step(
+            key="llvmdev", repo=LLVMLITE_REPO, workflow="", downloads=True
+        ),
         "download_llvmlite_conda": Step(
             key="llvmlite_conda", repo=LLVMLITE_REPO, workflow="", downloads=True
         ),
