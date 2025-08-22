@@ -38,8 +38,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 # ------------------------------- Constants --------------------------------- #
 
-LLVMLITE_REPO = "swap357/llvmlite"
-NUMBA_REPO    = "swap357/numba"
+LLVMLITE_REPO = "numba/llvmlite"
+NUMBA_REPO    = "numba/numba"
 DEFAULT_BRANCH = "main"
 DEFAULT_PLATFORMS = ["osx-64", "osx-arm64", "win-64", "linux-aarch64", "linux-64"]
 
@@ -61,17 +61,19 @@ class GhClient:
     # ---- Low-level runners ---- #
 
     def _run(self, args: Sequence[str]) -> None:
+        # Always log the gh command about to run
+        self._print_cmd(args)
         if self.dry_run:
-            self._print_cmd(args)
             return
         self._retry(lambda: subprocess.run(args, check=True), args)
 
     def _check_output(self, args: Sequence[str]) -> str:
+        # Always log the gh command about to run
+        self._print_cmd(args)
         if self.dry_run:
-            self._print_cmd(args)
             return ""
-        out = []
-        def _call():
+        out: List[str] = []
+        def _call() -> None:
             out.append(subprocess.check_output(args, text=True))
         self._retry(_call, args)
         return out[-1] if out else ""
@@ -94,7 +96,7 @@ class GhClient:
 
     def _print_cmd(self, args: Sequence[str]) -> None:
         if self.log_cmds:
-            print(shlex.join(args))
+            logging.info(shlex.join(args))
 
     # ---- Auth & Host ---- #
 
@@ -124,7 +126,7 @@ class GhClient:
             "--workflow", workflow,
             "--branch", branch,
             "--limit", str(limit),
-            "--json", "databaseId,headBranch,workflowName,status,createdAt"
+            "--json", "databaseId,headBranch,workflowName,status,conclusion,createdAt"
         ]
         out = self._check_output(args)
         try:
@@ -143,6 +145,19 @@ class GhClient:
         ])
         data = json.loads(out or "{}")
         return data.get("conclusion", "")
+
+    def get_pr_head_branch(self, repo: str, pr_number: int) -> str:
+        out = self._check_output([
+            "gh", "pr", "view", str(pr_number),
+            "--repo", repo,
+            "--json", "headRefName"
+        ])
+        data = json.loads(out or "{}")
+        branch = data.get("headRefName")
+        if not branch:
+            logging.error("Unable to resolve headRefName for PR #%s on %s", pr_number, repo)
+            sys.exit(1)
+        return branch
 
     def download_artifacts(self, repo: str, run_id: int, dest: Path) -> None:
         args = ["gh", "run", "download", str(run_id), "--repo", repo, "--dir", str(dest)]
@@ -216,6 +231,7 @@ class GHARunner:
         self.artifacts_dir = artifacts_dir
         self.continue_on_failure = continue_on_failure
         self.dry_run = dry_run
+        self.from_pr: Optional[int] = None
 
     # ---- Core lifecycle ---- #
 
@@ -227,7 +243,7 @@ class GHARunner:
                     if self.dry_run:
                         # Skip download steps entirely in dry-run
                         continue
-                    self._download(step)
+                    self._download(step, from_pr=getattr(self, "from_pr", None))
                 else:
                     self._dispatch_and_wait(step)
             except SystemExit as e:
@@ -327,12 +343,12 @@ class GHARunner:
 
         self.state.set(key, StateEntry(run_id=run_id, completed=True, conclusion=concl, repo=step.repo, branch=branch))
 
-    def _download(self, step: Step) -> None:
+    def _download(self, step: Step, from_pr: Optional[int] = None) -> None:
         """Download artifacts for either a single step key or fan-out per platform."""
         keys = [step.key] if not step.needs_platforms else [f"{step.key}_{p}" for p in self.platforms]
         for key in keys:
             entry = self.state.get(key)
-            if not entry.run_id or entry.conclusion != "success":
+            if (not entry.run_id or entry.conclusion != "success") and from_pr is None:
                 logging.error("Cannot download %s: no successful run recorded.", key)
                 if not self.continue_on_failure:
                     sys.exit(1)
@@ -345,7 +361,35 @@ class GHARunner:
                 if not self.continue_on_failure:
                     sys.exit(1)
                 continue
-            self.gh.download_artifacts(expected_repo, int(entry.run_id), dest)
+            # Resolve run_id from PR if requested and missing/unsuccessful
+            run_id_to_download = entry.run_id if entry.run_id and entry.conclusion == "success" else None
+            if from_pr is not None and run_id_to_download is None:
+                # Build workflow filename
+                platform = key.split("_")[-1] if "_" in key and step.needs_platforms else None
+                workflow_template = step.workflow
+                workflow = (workflow_template.format(platform=platform) if platform else workflow_template)
+                # Find PR head branch and select latest success
+                pr_branch = self.gh.get_pr_head_branch(expected_repo, int(from_pr))
+                runs = self.gh.list_runs(expected_repo, workflow, pr_branch)
+                # prefer latest success else latest completed
+                def _sort_key(r: Dict[str, Any]) -> str:
+                    return r.get("createdAt", "")
+                sorted_runs = sorted(runs, key=_sort_key, reverse=True)
+                for r in sorted_runs:
+                    if r.get("conclusion") == "success":
+                        run_id_to_download = int(r.get("databaseId"))
+                        break
+                if run_id_to_download is None:
+                    for r in sorted_runs:
+                        if r.get("status") == "completed":
+                            run_id_to_download = int(r.get("databaseId"))
+                            break
+            if run_id_to_download is None:
+                logging.error("No suitable run found for %s", key)
+                if not self.continue_on_failure:
+                    sys.exit(1)
+                continue
+            self.gh.download_artifacts(expected_repo, int(run_id_to_download), dest)
             # best-effort check
             if not any(dest.iterdir()):
                 logging.warning("No artifacts found for %s (run %s).", key, entry.run_id)
@@ -406,6 +450,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("-o", "--artifacts-dir", default=str((Path("artifacts")).resolve()), metavar="DIR")
     parser.add_argument("-r", "--reuse-run", action="append", metavar="STEP:RUN_ID",
                         help="STEP:RUN_ID to seed state")
+    parser.add_argument("-pr", "--from-pr", type=int, metavar="PR",
+                        help="Resolve and use the latest successful runs from this PR's head branch for download_* steps")
     parser.add_argument("-R", "--reset-state", action="store_true", help="Delete state and exit")
     parser.add_argument("-d", "--dry-run", action="store_true", help="Print gh commands instead of executing")
     parser.add_argument("-c", "--continue-on-failure", action="store_true", help="Keep going after a failure")
@@ -534,6 +580,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         continue_on_failure=args.continue_on_failure,
         dry_run=args.dry_run,
     )
+    # Wire --from-pr for download steps
+    if args.from_pr is not None:
+        # Ensure all requested steps are download_* when using --from-pr
+        non_download = [s.key for s in requested if not s.downloads]
+        if non_download:
+            logging.error("--from-pr can only be used with download_* steps. Non-download: %s", ", ".join(non_download))
+            return 1
+        runner.from_pr = int(args.from_pr)
     return runner.run(requested)
 
 
