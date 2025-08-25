@@ -232,6 +232,8 @@ class GHARunner:
         self.continue_on_failure = continue_on_failure
         self.dry_run = dry_run
         self.from_pr: Optional[int] = None
+        # Planning mode: when set, we only generate gh commands (no execution)
+        self.plan_only: bool = False
 
     # ---- Core lifecycle ---- #
 
@@ -310,9 +312,8 @@ class GHARunner:
             else workflow_template
         )
 
-        # Dry-run: print the dispatch command and return without polling/watching
-        if self.dry_run:
-            # Ensure the dispatch command is shown
+        # Dry-run or plan-only: print the dispatch command and return without polling/watching
+        if self.dry_run or self.plan_only:
             _ = self.gh.dispatch_workflow(step.repo, workflow, branch, inputs)
             return
 
@@ -343,6 +344,129 @@ class GHARunner:
 
         self.state.set(key, StateEntry(run_id=run_id, completed=True, conclusion=concl, repo=step.repo, branch=branch))
 
+    # ---- Planning helpers ---- #
+    def build_commands_for_steps(self, steps: Iterable[Step], llvmlite_pr: Optional[int] = None) -> List[str]:
+        """Return a list of gh CLI command strings that would be executed.
+
+        - For dispatch steps, we include `gh workflow run ... -f key=value` inputs.
+        - For download steps, we include `gh run download ... --dir ...` commands.
+        - If llvmlite_pr is provided, we will attempt to resolve upstream run ids
+          for inputs by inspecting the PR head branch for relevant workflows.
+        """
+        original_log_flag = self.gh.log_cmds
+        cmds: List[str] = []
+
+        try:
+            # Capture printed commands by temporarily intercepting logging
+            # Instead, build the commands directly to avoid parsing logs
+            for step in steps:
+                if step.downloads:
+                    # Enumerate keys (single or per platform)
+                    keys = [step.key] if not step.needs_platforms else [f"{step.key}_{p}" for p in self.platforms]
+                    for key in keys:
+                        # Determine run id: prefer state; else from --from-pr logic
+                        entry = self.state.get(key)
+                        expected_repo = step.repo
+                        run_id: Optional[int] = None
+                        if entry.run_id and entry.conclusion == "success":
+                            run_id = entry.run_id
+                        elif self.from_pr is not None:
+                            # Infer workflow filename
+                            platform = key.split("_")[-1] if "_" in key and step.needs_platforms else None
+                            if step.key == "llvmlite_wheels" and platform:
+                                workflow = f"llvmlite_{platform}_wheel_builder.yml"
+                            elif step.key == "llvmlite_conda":
+                                workflow = "llvmlite_conda_builder.yml"
+                            elif step.key == "llvmdev":
+                                workflow = "llvmdev_build.yml"
+                            elif step.key == "numba_conda" and platform:
+                                workflow = f"numba_{platform}_conda_builder.yml"
+                            elif step.key == "numba_wheels" and platform:
+                                workflow = f"numba_{platform}_wheel_builder.yml"
+                            else:
+                                workflow = ""
+
+                            if workflow:
+                                pr_branch = self.gh.get_pr_head_branch(expected_repo, int(self.from_pr))
+                                runs = self.gh.list_runs(expected_repo, workflow, pr_branch)
+                                sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                                for r in sorted_runs:
+                                    if r.get("conclusion") == "success":
+                                        run_id = int(r.get("databaseId"))
+                                        break
+                                if run_id is None:
+                                    for r in sorted_runs:
+                                        if r.get("status") == "completed":
+                                            run_id = int(r.get("databaseId"))
+                                            break
+                        if run_id is None:
+                            # Leave a placeholder so users see intent
+                            run_id_str = "<RUN_ID>"
+                        else:
+                            run_id_str = str(run_id)
+                        dest = str((self.artifacts_dir / key).resolve())
+                        cmd = shlex.join(["gh", "run", "download", run_id_str, "--repo", expected_repo, "--dir", dest])
+                        cmds.append(cmd)
+                else:
+                    # Dispatch steps: we may need to gather inputs
+                    base_inputs: Dict[str, str] = {}
+                    if step.inputs_from and step.input_name:
+                        # Try state first
+                        upstream = self.state.get(step.inputs_from)
+                        if upstream.run_id and upstream.conclusion == "success":
+                            base_inputs[step.input_name] = str(upstream.run_id)
+                        elif llvmlite_pr is not None and step.inputs_from in {"llvmdev", "llvmlite_conda", "llvmlite_wheels"}:
+                            # Resolve upstream from llvmlite PR if requested
+                            if step.inputs_from in {"llvmdev", "llvmlite_conda"}:
+                                wf = "llvmdev_build.yml" if step.inputs_from == "llvmdev" else "llvmlite_conda_builder.yml"
+                                pr_branch = self.gh.get_pr_head_branch(LLVMLITE_REPO, int(llvmlite_pr))
+                                runs = self.gh.list_runs(LLVMLITE_REPO, wf, pr_branch)
+                                sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                                resolved: Optional[int] = None
+                                for r in sorted_runs:
+                                    if r.get("conclusion") == "success":
+                                        resolved = int(r.get("databaseId"))
+                                        break
+                                if resolved is None:
+                                    for r in sorted_runs:
+                                        if r.get("status") == "completed":
+                                            resolved = int(r.get("databaseId"))
+                                            break
+                                if resolved is not None:
+                                    base_inputs[step.input_name] = str(resolved)
+                            # For llvmlite_wheels, we resolve per-platform later
+
+                    targets = self.platforms if step.needs_platforms else [None]
+                    for plat in targets:
+                        inputs = dict(base_inputs)
+                        if plat and step.inputs_from == "llvmlite_wheels" and step.input_name and llvmlite_pr is not None and step.downloads is False:
+                            # For platform-aligned upstream wheel runs, resolve per platform if missing
+                            upstream_key = f"llvmlite_wheels_{plat}"
+                            upstream_entry = self.state.get(upstream_key)
+                            if upstream_entry.run_id and upstream_entry.conclusion == "success":
+                                inputs[step.input_name] = str(upstream_entry.run_id)
+                            else:
+                                wf = f"llvmlite_{plat}_wheel_builder.yml"
+                                pr_branch = self.gh.get_pr_head_branch(LLVMLITE_REPO, int(llvmlite_pr))
+                                runs = self.gh.list_runs(LLVMLITE_REPO, wf, pr_branch)
+                                sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                                for r in sorted_runs:
+                                    if r.get("conclusion") == "success":
+                                        inputs[step.input_name] = str(int(r.get("databaseId")))
+                                        break
+
+                        workflow_template = step.workflow
+                        workflow = workflow_template.format(platform=plat) if plat else workflow_template
+                        args: List[str] = ["gh", "workflow", "run", workflow, "--repo", step.repo, "--ref", step.branch_ref]
+                        for k, v in inputs.items():
+                            args += ["-f", f"{k}={v}"]
+                        cmds.append(shlex.join(args))
+
+        finally:
+            self.gh.log_cmds = original_log_flag
+
+        return cmds
+
     def _download(self, step: Step, from_pr: Optional[int] = None) -> None:
         """Download artifacts for either a single step key or fan-out per platform."""
         keys = [step.key] if not step.needs_platforms else [f"{step.key}_{p}" for p in self.platforms]
@@ -364,10 +488,27 @@ class GHARunner:
             # Resolve run_id from PR if requested and missing/unsuccessful
             run_id_to_download = entry.run_id if entry.run_id and entry.conclusion == "success" else None
             if from_pr is not None and run_id_to_download is None:
-                # Build workflow filename
+                # Derive workflow filename for download steps (step.workflow is empty by design)
                 platform = key.split("_")[-1] if "_" in key and step.needs_platforms else None
-                workflow_template = step.workflow
-                workflow = (workflow_template.format(platform=platform) if platform else workflow_template)
+                if step.key == "llvmlite_wheels" and platform:
+                    workflow = f"llvmlite_{platform}_wheel_builder.yml"
+                elif step.key == "llvmlite_conda":
+                    workflow = "llvmlite_conda_builder.yml"
+                elif step.key == "llvmdev":
+                    workflow = "llvmdev_build.yml"
+                elif step.key == "numba_conda" and platform:
+                    workflow = f"numba_{platform}_conda_builder.yml"
+                elif step.key == "numba_wheels" and platform:
+                    workflow = f"numba_{platform}_wheel_builder.yml"
+                else:
+                    workflow = ""
+
+                if not workflow:
+                    logging.error("Cannot infer workflow filename for %s (platform=%s)", key, platform or "-")
+                    if not self.continue_on_failure:
+                        sys.exit(1)
+                    continue
+
                 # Find PR head branch and select latest success
                 pr_branch = self.gh.get_pr_head_branch(expected_repo, int(from_pr))
                 runs = self.gh.list_runs(expected_repo, workflow, pr_branch)
@@ -406,9 +547,12 @@ class GHARunner:
             runs = self.gh.list_runs(repo, workflow, branch)
             candidates: List[tuple[datetime, int]] = []
             for r in runs:
+                ts = r.get("createdAt", "")
+                if not ts:
+                    continue
                 try:
-                    created = iso8601_to_aware(r.get("createdAt", ""))
-                except Exception:
+                    created = iso8601_to_aware(ts)
+                except ValueError:
                     continue
                 if r.get("status") in statuses and r.get("headBranch") == branch and created >= since:
                     candidates.append((created, int(r.get("databaseId"))))
@@ -452,6 +596,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="STEP:RUN_ID to seed state")
     parser.add_argument("-pr", "--from-pr", type=int, metavar="PR",
                         help="Resolve and use the latest successful runs from this PR's head branch for download_* steps")
+    parser.add_argument("--print-commands", action="store_true",
+                        help="Print the gh CLI commands that would be executed for the requested steps, then exit")
+    parser.add_argument("--llvmlite-pr", type=int, metavar="PR",
+                        help="When planning commands, resolve upstream llvmlite run IDs from this PR (used for inputs)")
     parser.add_argument("-R", "--reset-state", action="store_true", help="Delete state and exit")
     parser.add_argument("-d", "--dry-run", action="store_true", help="Print gh commands instead of executing")
     parser.add_argument("-c", "--continue-on-failure", action="store_true", help="Keep going after a failure")
@@ -494,7 +642,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     gh = GhClient(dry_run=args.dry_run)
-    if not args.dry_run and not os.getenv("GH_TOKEN") and not gh.is_authenticated():
+    if not (args.dry_run or args.print_commands) and not os.getenv("GH_TOKEN") and not gh.is_authenticated():
         logging.error("Authentication required: set GH_TOKEN or run 'gh auth login'.")
         return 1
     logging.info("Using GitHub host: %s", gh.host)
@@ -571,7 +719,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 logging.error("Invalid --reuse-run format: %s (expected STEP:RUN_ID)", seed)
                 return 1
 
-    # Run
+    # Run or plan-only output
     runner = GHARunner(
         gh=gh,
         state=store,
@@ -588,6 +736,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logging.error("--from-pr can only be used with download_* steps. Non-download: %s", ", ".join(non_download))
             return 1
         runner.from_pr = int(args.from_pr)
+    if args.print_commands:
+        runner.plan_only = True
+        cmds = runner.build_commands_for_steps(requested, llvmlite_pr=args.llvmlite_pr)
+        for c in cmds:
+            print(c)
+        return 0
     return runner.run(requested)
 
 
