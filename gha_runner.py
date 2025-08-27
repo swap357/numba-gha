@@ -41,7 +41,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 LLVMLITE_REPO = "numba/llvmlite"
 NUMBA_REPO    = "numba/numba"
 DEFAULT_BRANCH = "main"
-DEFAULT_PLATFORMS = ["osx-64", "osx-arm64", "win-64", "linux-aarch64", "linux-64"]
+DEFAULT_PLATFORMS = ["win-64", "osx-64", "linux-64", "linux-aarch64", "osx-arm64"]
 
 # ------------------------------- Utilities --------------------------------- #
 
@@ -53,8 +53,7 @@ def iso8601_to_aware(ts: str) -> datetime:
 
 class GhClient:
     """Thin wrapper over `gh` with retries, host awareness, and helpers."""
-    def __init__(self, dry_run: bool = False, host: Optional[str] = None, log_cmds: bool = True):
-        self.dry_run = dry_run
+    def __init__(self, host: Optional[str] = None, log_cmds: bool = True):
         self.host = host or os.getenv("GH_HOST", "github.com")
         self.log_cmds = log_cmds
 
@@ -63,15 +62,11 @@ class GhClient:
     def _run(self, args: Sequence[str]) -> None:
         # Always log the gh command about to run
         self._print_cmd(args)
-        if self.dry_run:
-            return
         self._retry(lambda: subprocess.run(args, check=True), args)
 
     def _check_output(self, args: Sequence[str]) -> str:
         # Always log the gh command about to run
         self._print_cmd(args)
-        if self.dry_run:
-            return ""
         out: List[str] = []
         def _call() -> None:
             out.append(subprocess.check_output(args, text=True))
@@ -223,17 +218,24 @@ class GHARunner:
         platforms: Sequence[str],
         artifacts_dir: Path,
         continue_on_failure: bool = False,
-        dry_run: bool = False,
     ):
         self.gh = gh
         self.state = state
         self.platforms = list(platforms)
         self.artifacts_dir = artifacts_dir
         self.continue_on_failure = continue_on_failure
-        self.dry_run = dry_run
         self.from_pr: Optional[int] = None
         # Planning mode: when set, we only generate gh commands (no execution)
         self.plan_only: bool = False
+        # Per-platform overrides for llvmlite wheel run IDs used by numba_wheels
+        # e.g., {"linux-64": "17123456789", "osx-64": "17123456788"}
+        self.override_wheel_run_ids_by_platform: Dict[str, str] = {}
+        # Manual overrides for upstream run IDs keyed by upstream step key
+        # e.g., {"llvmlite_conda": "17246956402"}
+        self.override_input_run_ids: Dict[str, str] = {}
+        # Dispatch-only mode: dispatch workflows but do not wait for completion
+        self.dispatch_only: bool = False
+        self.dispatch_delay_seconds: float = 10.0
 
     # ---- Core lifecycle ---- #
 
@@ -272,14 +274,29 @@ class GHARunner:
         # Prepare workflow inputs (optional upstream run_id)
         inputs: Dict[str, str] = {}
         if step.inputs_from and step.input_name:
-            upstream = self.state.get(step.inputs_from)
-            if upstream.run_id and upstream.conclusion == "success":
-                inputs[step.input_name] = str(upstream.run_id)
-                logging.info("Using upstream %s run %s for %s", step.inputs_from, upstream.run_id, step.key)
+            # Highest precedence: explicit override from CLI
+            override_run_id = self.override_input_run_ids.get(step.inputs_from)
+            if override_run_id:
+                inputs[step.input_name] = override_run_id
+                logging.info("Using override %s=%s for %s", step.input_name, override_run_id, step.key)
+            else:
+                upstream = self.state.get(step.inputs_from)
+                if upstream.run_id and upstream.conclusion == "success":
+                    inputs[step.input_name] = str(upstream.run_id)
+                    logging.info("Using upstream %s run %s for %s", step.inputs_from, upstream.run_id, step.key)
 
         if step.needs_platforms:
-            for plat in self.platforms:
+            # Determine platform dispatch order
+            platforms_order = list(self.platforms)
+            if self.dispatch_only:
+                preferred = ["win-64", "osx-64", "linux-64", "linux-aarch64", "osx-arm64"]
+                ordered = [p for p in preferred if p in platforms_order]
+                remaining = [p for p in platforms_order if p not in ordered]
+                platforms_order = ordered + remaining
+            for plat in platforms_order:
                 self._dispatch_and_wait_one(step, plat, inputs)
+                if self.dispatch_only:
+                    time.sleep(self.dispatch_delay_seconds)
         else:
             self._dispatch_and_wait_one(step, None, inputs)
 
@@ -299,10 +316,22 @@ class GHARunner:
         # If this step consumes an upstream run_id and we are fanned-out per-platform,
         # try to source the platform-aligned upstream entry (e.g., llvmlite_wheels_{platform}).
         if platform and step.inputs_from and step.input_name:
-            upstream_key = f"{step.inputs_from}_{platform}"
-            upstream_entry = self.state.get(upstream_key)
-            if upstream_entry.run_id and upstream_entry.conclusion == "success":
-                inputs[step.input_name] = str(upstream_entry.run_id)
+            # Highest precedence: per-platform override for llvmlite wheels → numba_wheels
+            if step.inputs_from == "llvmlite_wheels":
+                override_plat_run = self.override_wheel_run_ids_by_platform.get(platform)
+                if override_plat_run:
+                    inputs[step.input_name] = override_plat_run
+                    logging.info("Using override %s=%s for %s (%s)", step.input_name, override_plat_run, step.key, platform)
+                else:
+                    upstream_key = f"{step.inputs_from}_{platform}"
+                    upstream_entry = self.state.get(upstream_key)
+                    if upstream_entry.run_id and upstream_entry.conclusion == "success":
+                        inputs[step.input_name] = str(upstream_entry.run_id)
+            else:
+                upstream_key = f"{step.inputs_from}_{platform}"
+                upstream_entry = self.state.get(upstream_key)
+                if upstream_entry.run_id and upstream_entry.conclusion == "success":
+                    inputs[step.input_name] = str(upstream_entry.run_id)
 
         # Resolve workflow filename directly using provided platform
         workflow_template = step.workflow
@@ -312,8 +341,8 @@ class GHARunner:
             else workflow_template
         )
 
-        # Dry-run or plan-only: print the dispatch command and return without polling/watching
-        if self.dry_run or self.plan_only:
+        # Plan-only: print the dispatch command and return without polling/watching
+        if self.plan_only:
             _ = self.gh.dispatch_workflow(step.repo, workflow, branch, inputs)
             return
 
@@ -328,21 +357,23 @@ class GHARunner:
             self.state.set(key, StateEntry(run_id=run_id, completed=False, conclusion="", repo=step.repo, branch=branch))
             logging.info("Recorded new %s run %s", key, run_id)
 
-        # Wait
-        try:
-            self.gh.watch_run(step.repo, int(run_id))
-        except KeyboardInterrupt:
-            logging.info("Interrupted during watch of %s; aborting.", key)
-            sys.exit(130)
+        # In dispatch-only mode, do not wait
+        if not self.dispatch_only:
+            try:
+                self.gh.watch_run(step.repo, int(run_id))
+            except KeyboardInterrupt:
+                logging.info("Interrupted during watch of %s; aborting.", key)
+                sys.exit(130)
 
-        concl = self.gh.get_run_conclusion(step.repo, int(run_id))
-        if concl != "success":
-            logging.error("Run %s for %s ended '%s'. See: https://%s/%s/actions/runs/%s",
-                          run_id, key, concl, self.gh.host, step.repo, run_id)
+        if not self.dispatch_only:
+            concl = self.gh.get_run_conclusion(step.repo, int(run_id))
+            if concl != "success":
+                logging.error("Run %s for %s ended '%s'. See: https://%s/%s/actions/runs/%s",
+                              run_id, key, concl, self.gh.host, step.repo, run_id)
+                self.state.set(key, StateEntry(run_id=run_id, completed=True, conclusion=concl, repo=step.repo, branch=branch))
+                sys.exit(1)
+
             self.state.set(key, StateEntry(run_id=run_id, completed=True, conclusion=concl, repo=step.repo, branch=branch))
-            sys.exit(1)
-
-        self.state.set(key, StateEntry(run_id=run_id, completed=True, conclusion=concl, repo=step.repo, branch=branch))
 
     # ---- Planning helpers ---- #
     def build_commands_for_steps(self, steps: Iterable[Step], llvmlite_pr: Optional[int] = None) -> List[str]:
@@ -411,13 +442,17 @@ class GHARunner:
                     # Dispatch steps: we may need to gather inputs
                     base_inputs: Dict[str, str] = {}
                     if step.inputs_from and step.input_name:
-                        # Try state first
-                        upstream = self.state.get(step.inputs_from)
-                        if upstream.run_id and upstream.conclusion == "success":
-                            base_inputs[step.input_name] = str(upstream.run_id)
-                        elif llvmlite_pr is not None and step.inputs_from in {"llvmdev", "llvmlite_conda", "llvmlite_wheels"}:
-                            # Resolve upstream from llvmlite PR if requested
-                            if step.inputs_from in {"llvmdev", "llvmlite_conda"}:
+                        # 1) Explicit override takes precedence
+                        override_run = self.override_input_run_ids.get(step.inputs_from)
+                        if override_run:
+                            base_inputs[step.input_name] = override_run
+                        else:
+                            # 2) Try state
+                            upstream = self.state.get(step.inputs_from)
+                            if upstream.run_id and upstream.conclusion == "success":
+                                base_inputs[step.input_name] = str(upstream.run_id)
+                            # 3) Optionally resolve from llvmlite PR (non-platform inputs only)
+                            elif llvmlite_pr is not None and step.inputs_from in {"llvmdev", "llvmlite_conda"}:
                                 wf = "llvmdev_build.yml" if step.inputs_from == "llvmdev" else "llvmlite_conda_builder.yml"
                                 pr_branch = self.gh.get_pr_head_branch(LLVMLITE_REPO, int(llvmlite_pr))
                                 runs = self.gh.list_runs(LLVMLITE_REPO, wf, pr_branch)
@@ -434,26 +469,30 @@ class GHARunner:
                                             break
                                 if resolved is not None:
                                     base_inputs[step.input_name] = str(resolved)
-                            # For llvmlite_wheels, we resolve per-platform later
+                        # For llvmlite_wheels, per-platform handling happens below
 
                     targets = self.platforms if step.needs_platforms else [None]
                     for plat in targets:
                         inputs = dict(base_inputs)
-                        if plat and step.inputs_from == "llvmlite_wheels" and step.input_name and llvmlite_pr is not None and step.downloads is False:
-                            # For platform-aligned upstream wheel runs, resolve per platform if missing
-                            upstream_key = f"llvmlite_wheels_{plat}"
-                            upstream_entry = self.state.get(upstream_key)
-                            if upstream_entry.run_id and upstream_entry.conclusion == "success":
-                                inputs[step.input_name] = str(upstream_entry.run_id)
+                        if plat and step.inputs_from == "llvmlite_wheels" and step.input_name and step.downloads is False:
+                            # Precedence: per-platform override → state → llvmlite PR resolution
+                            override_plat = self.override_wheel_run_ids_by_platform.get(plat)
+                            if override_plat:
+                                inputs[step.input_name] = override_plat
                             else:
-                                wf = f"llvmlite_{plat}_wheel_builder.yml"
-                                pr_branch = self.gh.get_pr_head_branch(LLVMLITE_REPO, int(llvmlite_pr))
-                                runs = self.gh.list_runs(LLVMLITE_REPO, wf, pr_branch)
-                                sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
-                                for r in sorted_runs:
-                                    if r.get("conclusion") == "success":
-                                        inputs[step.input_name] = str(int(r.get("databaseId")))
-                                        break
+                                upstream_key = f"llvmlite_wheels_{plat}"
+                                upstream_entry = self.state.get(upstream_key)
+                                if upstream_entry.run_id and upstream_entry.conclusion == "success":
+                                    inputs[step.input_name] = str(upstream_entry.run_id)
+                                elif llvmlite_pr is not None:
+                                    wf = f"llvmlite_{plat}_wheel_builder.yml"
+                                    pr_branch = self.gh.get_pr_head_branch(LLVMLITE_REPO, int(llvmlite_pr))
+                                    runs = self.gh.list_runs(LLVMLITE_REPO, wf, pr_branch)
+                                    sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                                    for r in sorted_runs:
+                                        if r.get("conclusion") == "success":
+                                            inputs[step.input_name] = str(int(r.get("databaseId")))
+                                            break
 
                         workflow_template = step.workflow
                         workflow = workflow_template.format(platform=plat) if plat else workflow_template
@@ -598,13 +637,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Resolve and use the latest successful runs from this PR's head branch for download_* steps")
     parser.add_argument("--print-commands", action="store_true",
                         help="Print the gh CLI commands that would be executed for the requested steps, then exit")
-    parser.add_argument("--llvmlite-pr", type=int, metavar="PR",
-                        help="When planning commands, resolve upstream llvmlite run IDs from this PR (used for inputs)")
+    # Deprecated/advanced flags (hidden to keep CLI concise)
+    parser.add_argument("--llvmlite-pr", type=int, metavar="PR", help=argparse.SUPPRESS)
+    parser.add_argument("--llvmlite-conda-run-id", type=int, metavar="RUN_ID", help=argparse.SUPPRESS)
+    parser.add_argument("--llvmlite-wheel-run-ids", metavar="PLAT=RUN_ID[,PLAT=RUN_ID]", help=argparse.SUPPRESS)
+    parser.add_argument("-u", "--use-last-run", action="store_true",
+                        help="Resolve latest successful run IDs from the target branch (or PR head with -pr) and use them (writes to state for downloads; injects inputs for dependent steps)")
+    # Back-compat alias (hidden)
+    parser.add_argument("--auto-populate", action="store_true", dest="use_last_run", help=argparse.SUPPRESS)
     parser.add_argument("-R", "--reset-state", action="store_true", help="Delete state and exit")
-    parser.add_argument("-d", "--dry-run", action="store_true", help="Print gh commands instead of executing")
-    parser.add_argument("-c", "--continue-on-failure", action="store_true", help="Keep going after a failure")
+    parser.add_argument("-c", "--continue-on-failure", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("-v", "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARN", "ERROR"],
                         help="Logging level")
+    parser.add_argument("--dispatch-all", action="store_true",
+                        help="Dispatch workflows without waiting for completion (stacks per-platform with a small delay)")
+    parser.add_argument("--dispatch-delay-seconds", type=float, default=2.0,
+                        help="Delay between dispatches in dispatch-all mode")
     return parser.parse_args(argv)
 
 
@@ -641,8 +689,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logging.info("No state file found at %s; nothing to reset", state_path)
         return 0
 
-    gh = GhClient(dry_run=args.dry_run)
-    if not (args.dry_run or args.print_commands) and not os.getenv("GH_TOKEN") and not gh.is_authenticated():
+    gh = GhClient()
+    if not (args.print_commands) and not os.getenv("GH_TOKEN") and not gh.is_authenticated():
         logging.error("Authentication required: set GH_TOKEN or run 'gh auth login'.")
         return 1
     logging.info("Using GitHub host: %s", gh.host)
@@ -726,22 +774,122 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         platforms=platforms,
         artifacts_dir=artifacts_dir,
         continue_on_failure=args.continue_on_failure,
-        dry_run=args.dry_run,
     )
-    # Wire --from-pr for download steps
+    runner.dispatch_only = bool(args.dispatch_all)
+    runner.dispatch_delay_seconds = float(args.dispatch_delay_seconds)
+    # Wire --from-pr for download steps (store for later use)
     if args.from_pr is not None:
-        # Ensure all requested steps are download_* when using --from-pr
+        # Validate only if user also requested download_* steps population
         non_download = [s.key for s in requested if not s.downloads]
-        if non_download:
-            logging.error("--from-pr can only be used with download_* steps. Non-download: %s", ", ".join(non_download))
+        if non_download and args.use_last_run:
+            logging.error("--from-pr can only be used with download_* steps when --auto-populate is set. Non-download: %s", ", ".join(non_download))
             return 1
         runner.from_pr = int(args.from_pr)
+
+    # Use last runs: resolve latest successful run ids using PR head branch if provided, else branch refs
+    if args.use_last_run:
+        for step in requested:
+            # Populate download_* step run_ids directly into state
+            if step.downloads:
+                keys = [step.key] if not step.needs_platforms else [f"{step.key}_{p}" for p in platforms]
+                for key in keys:
+                    entry = store.get(key)
+                    if entry.run_id and entry.conclusion == "success":
+                        continue
+                    expected_repo = step.repo
+                    platform = key.split("_")[-1] if "_" in key and step.needs_platforms else None
+                    if step.key == "llvmlite_wheels" and platform:
+                        workflow = f"llvmlite_{platform}_wheel_builder.yml"
+                    elif step.key == "llvmlite_conda":
+                        workflow = "llvmlite_conda_builder.yml"
+                    elif step.key == "llvmdev":
+                        workflow = "llvmdev_build.yml"
+                    elif step.key == "numba_conda" and platform:
+                        workflow = f"numba_{platform}_conda_builder.yml"
+                    elif step.key == "numba_wheels" and platform:
+                        workflow = f"numba_{platform}_wheel_builder.yml"
+                    else:
+                        workflow = ""
+                    if not workflow:
+                        continue
+                    # Choose branch: PR head branch if provided, else the configured ref for the repo
+                    if args.from_pr is not None:
+                        branch_ref = gh.get_pr_head_branch(expected_repo, int(args.from_pr))
+                    else:
+                        branch_ref = args.llvmlite_branch if expected_repo == LLVMLITE_REPO else args.numba_branch
+                    runs = gh.list_runs(expected_repo, workflow, branch_ref)
+                    sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                    resolved: Optional[int] = None
+                    for r in sorted_runs:
+                        if r.get("conclusion") == "success":
+                            resolved = int(r.get("databaseId"))
+                            break
+                    if resolved is None:
+                        for r in sorted_runs:
+                            if r.get("status") == "completed":
+                                resolved = int(r.get("databaseId"))
+                                break
+                    if resolved is not None:
+                        store.set(key, StateEntry(run_id=resolved, completed=True, conclusion="success", repo=expected_repo, branch=branch_ref))
+            # Populate upstream inputs for dispatch steps (e.g., numba_conda and numba_wheels)
+            else:
+                if step.key == "numba_conda":
+                    # Resolve llvmlite_conda run id on llvmlite branch/PR
+                    branch_ref = gh.get_pr_head_branch(LLVMLITE_REPO, int(args.from_pr)) if args.from_pr is not None else args.llvmlite_branch
+                    wf = "llvmlite_conda_builder.yml"
+                    runs = gh.list_runs(LLVMLITE_REPO, wf, branch_ref)
+                    sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                    resolved: Optional[int] = None
+                    for r in sorted_runs:
+                        if r.get("conclusion") == "success":
+                            resolved = int(r.get("databaseId"))
+                            break
+                    if resolved is None:
+                        for r in sorted_runs:
+                            if r.get("status") == "completed":
+                                resolved = int(r.get("databaseId"))
+                                break
+                    if resolved is not None:
+                        runner.override_input_run_ids["llvmlite_conda"] = str(resolved)
+                elif step.key == "numba_wheels":
+                    # Resolve llvmlite wheel run ids per platform
+                    branch_ref = gh.get_pr_head_branch(LLVMLITE_REPO, int(args.from_pr)) if args.from_pr is not None else args.llvmlite_branch
+                    for plat in platforms:
+                        wf = f"llvmlite_{plat}_wheel_builder.yml"
+                        runs = gh.list_runs(LLVMLITE_REPO, wf, branch_ref)
+                        sorted_runs = sorted(runs, key=lambda r: r.get("createdAt", ""), reverse=True)
+                        resolved: Optional[int] = None
+                        for r in sorted_runs:
+                            if r.get("conclusion") == "success":
+                                resolved = int(r.get("databaseId"))
+                                break
+                        if resolved is None:
+                            for r in sorted_runs:
+                                if r.get("status") == "completed":
+                                    resolved = int(r.get("databaseId"))
+                                    break
+                        if resolved is not None:
+                            runner.override_wheel_run_ids_by_platform[plat] = str(resolved)
+    # Wire explicit override for llvmlite conda run id
+    if args.llvmlite_conda_run_id is not None:
+        runner.override_input_run_ids["llvmlite_conda"] = str(int(args.llvmlite_conda_run_id))
     if args.print_commands:
         runner.plan_only = True
         cmds = runner.build_commands_for_steps(requested, llvmlite_pr=args.llvmlite_pr)
         for c in cmds:
             print(c)
         return 0
+    # Parse per-platform wheel run id overrides
+    if args.llvmlite_wheel_run_ids:
+        try:
+            for item in args.llvmlite_wheel_run_ids.split(","):
+                if not item.strip():
+                    continue
+                plat, runid = item.split("=", 1)
+                runner.override_wheel_run_ids_by_platform[plat.strip()] = runid.strip()
+        except ValueError:
+            logging.error("Invalid --llvmlite-wheel-run-ids format. Expected PLAT=RUN_ID[,PLAT=RUN_ID]")
+            return 1
     return runner.run(requested)
 
 
